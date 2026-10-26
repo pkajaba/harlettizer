@@ -956,6 +956,85 @@ fn a_fold_the_domain_cannot_hold_is_counted_and_not_written() {
     }
 }
 
+/// The same programme, with a fallback that mixes nothing: the intervals the
+/// fold is refused for carry the selection instead of the leading elements,
+/// and are counted as fallen back. The narrow presentations then name their
+/// channels as the selection does, and the elements still come back exactly.
+#[test]
+fn a_refused_fold_falls_back_to_the_selection() {
+    use hz_mlp::hierarchy::Presentation;
+    const ELEMENTS: usize = 12;
+    let frames = 40 * 130;
+    let planes: Vec<Vec<i32>> = (0..ELEMENTS)
+        .map(|element| noise(0xf011_5ca1 + element as u64, frames, 24))
+        .collect();
+    let row = |gains: &[(usize, f64)]| {
+        let mut out = vec![0.0; ELEMENTS];
+        for (element, gain) in gains {
+            out[*element] = *gain;
+        }
+        out
+    };
+    let seven: Vec<Vec<f64>> = (0..8)
+        .map(|channel| row(&[(channel, 1.0), (8 + channel % 4, 0.5)]))
+        .collect();
+    let five: Vec<Vec<f64>> = seven[..6].to_vec();
+    let two = vec![
+        row(&[(0, 0.7), (2, 0.5), (4, 0.7), (8, 0.35)]),
+        row(&[(1, 0.7), (2, 0.5), (5, 0.7), (9, 0.35)]),
+    ];
+    let elements: Vec<Vec<f64>> = (0..ELEMENTS)
+        .map(|element| row(&[(element, 1.0)]))
+        .collect();
+    let shaped = |two, five, seven| -> Vec<Presentation> {
+        [(2usize, two), (6, five), (8, seven), (12, elements.clone())]
+            .into_iter()
+            .map(|(channels, rows)| Presentation { channels, rows })
+            .collect()
+    };
+    let asked = shaped(two, five, seven);
+    let pick = |n: usize| -> Vec<Vec<f64>> { (0..n).map(|e| row(&[(e, 1.0)])).collect() };
+    let fallback = shaped(pick(2), pick(6), pick(8));
+
+    let config = config(ELEMENTS, 48_000, SampleBits::TwentyFour);
+    let mut encoder = Encoder::new(config).expect("twelve elements");
+    encoder.set_presentations_with_fallback(&asked, &fallback);
+    let stream = encode(&mut encoder, &planes);
+
+    let stats = encoder.stats();
+    assert_eq!(stats.folds_asked, 2, "two restart intervals, both asked");
+    assert_eq!(
+        stats.folds_over_the_domain, 0,
+        "the fallback was not turned away, so nothing is counted as refused"
+    );
+    assert_eq!(
+        (stats.folds_carried, stats.folds_fallen_back),
+        (2, 2),
+        "both intervals carry the fallback"
+    );
+    for (presentation, channels) in [(0usize, 2usize), (1, 6), (2, 8)] {
+        let got = decoder::decode(&stream, presentation).expect("the presentation decodes");
+        assert_eq!(got.channels, channels);
+        for (frame, chunk) in got.samples.chunks_exact(channels).enumerate() {
+            for (channel, sample) in chunk.iter().enumerate() {
+                assert_eq!(
+                    *sample, planes[channel][frame],
+                    "presentation {presentation}, frame {frame}, channel {channel}"
+                );
+            }
+        }
+    }
+    let full = decoder::decode(&stream, 3).expect("the elements decode");
+    for (frame, got) in full.samples.chunks_exact(ELEMENTS).enumerate() {
+        for (element, sample) in got.iter().enumerate() {
+            assert_eq!(
+                *sample, planes[element][frame],
+                "frame {frame}, element {element}"
+            );
+        }
+    }
+}
+
 /// A programme-like sixteen-channel input: tones at different pitches, a
 /// little noise under them, and two objects that are nothing but noise.
 fn programme_16(frames: usize) -> Vec<Vec<i32>> {

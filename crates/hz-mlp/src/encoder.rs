@@ -509,9 +509,15 @@ pub struct Encoder {
     /// shifted down by four are not in the same units, and a row that mixes
     /// them has to say so. So the caller states the *fold* and the encoder
     /// states the matrices, at the restart where it settles the shifts.
-    waiting: Option<Vec<crate::hierarchy::Presentation>>,
+    waiting: Option<(
+        Vec<crate::hierarchy::Presentation>,
+        Vec<crate::hierarchy::Presentation>,
+    )>,
     /// And what is in force, which is rebuilt whenever the shifts move.
     wants: Vec<crate::hierarchy::Presentation>,
+    /// What an interval carries instead when `wants` cannot be built for it;
+    /// empty for none, which leaves such an interval on the leading channels.
+    fallback: Vec<crate::hierarchy::Presentation>,
     /// What each early substream states as its own output shift, which is not
     /// what the encoder shifted by. See where it is chosen.
     presentation_shift: Vec<Vec<u8>>,
@@ -661,6 +667,10 @@ pub struct Stats {
     /// cascade stores. Every other refusal is a set of rows no cascade could
     /// host or write.
     pub folds_over_the_domain: u64,
+    /// Of the carried, those that carry the fallback of
+    /// [`Encoder::set_presentations_with_fallback`] because the first set was
+    /// refused.
+    pub folds_fallen_back: u64,
     pub units: u64,
     /// Total residual bits, and how many residuals, so the mean is
     /// recoverable.
@@ -742,6 +752,7 @@ impl Encoder {
             arrangement: Vec::new(),
             waiting: None,
             wants: Vec::new(),
+            fallback: Vec::new(),
             interval_shift: None,
             presentation_shift: Vec::new(),
             assignment: Vec::new(),
@@ -1051,7 +1062,39 @@ impl Encoder {
     /// Refused, and nothing changed, if there are more steps than one
     /// substream's declaration can hold.
     pub fn set_presentations(&mut self, presentations: &[crate::hierarchy::Presentation]) {
-        self.waiting = Some(presentations.to_vec());
+        self.waiting = Some((presentations.to_vec(), Vec::new()));
+    }
+
+    /// As [`Encoder::set_presentations`], with a second set of presentations
+    /// for the intervals the first cannot be built for.
+    ///
+    /// An interval whose folds are refused (see [`Stats::folds_asked`]) is
+    /// written with the leading channels as its narrow presentations, which
+    /// are not any mix a listener asked for. With a fallback it is tried
+    /// again with these rows instead, and only if they are refused too does
+    /// it go without. A fallback that mixes nothing (each row one element at
+    /// unity, a selection) is the set least likely to be refused, since it
+    /// asks the cascade for nothing it cannot give back. The two sets must
+    /// have the same shape: the same number of presentations, each with the
+    /// same number of channels.
+    pub fn set_presentations_with_fallback(
+        &mut self,
+        presentations: &[crate::hierarchy::Presentation],
+        fallback: &[crate::hierarchy::Presentation],
+    ) {
+        let same_shape = presentations.len() == fallback.len()
+            && presentations
+                .iter()
+                .zip(fallback)
+                .all(|(a, b)| a.channels == b.channels);
+        self.waiting = Some((
+            presentations.to_vec(),
+            if same_shape {
+                fallback.to_vec()
+            } else {
+                Vec::new()
+            },
+        ));
     }
 
     /// How hard to search from here on. See [`Effort`].
@@ -1309,9 +1352,10 @@ impl Encoder {
         // costed on the hierarchy, and found nothing: every weight was fitted
         // to a signal the channel no longer carried.
         if self.since_restart == 0
-            && let Some(next) = self.waiting.take()
+            && let Some((next, fallback)) = self.waiting.take()
         {
             self.wants = next;
+            self.fallback = fallback;
         }
         let planning = self.planning();
         let dynamic_range = self.dynamic_range;
@@ -1419,6 +1463,7 @@ impl Encoder {
     fn planning(&self) -> Planning {
         Planning {
             wants: self.wants.clone(),
+            fallback: self.fallback.clone(),
             channels: self.channels,
             coded: FrameSize {
                 frame_size: self.coded.frame_size,
@@ -1447,6 +1492,7 @@ impl Encoder {
         self.stats.folds_asked += planning.stats.folds_asked;
         self.stats.folds_carried += planning.stats.folds_carried;
         self.stats.folds_over_the_domain += planning.stats.folds_over_the_domain;
+        self.stats.folds_fallen_back += planning.stats.folds_fallen_back;
         if self.timed {
             self.phase_times[0] += planning.took;
         }
@@ -2739,6 +2785,7 @@ pub(crate) fn end_of_stream(shorten_by: u16) -> [u32; 2] {
 #[derive(Debug)]
 struct Planning {
     wants: Vec<crate::hierarchy::Presentation>,
+    fallback: Vec<crate::hierarchy::Presentation>,
     channels: usize,
     coded: FrameSize,
     decorrelation: bool,
@@ -2856,9 +2903,33 @@ impl Planning {
         // channel — which costs the dead bits the others had, and is what a
         // programme with one unrounded channel among rounded ones ends up
         // paying until the shifts are stated per substream.
-        if let Ok(built) = self.try_to_build(units, &shifts) {
+        let refusal = match self.build_with_either_shift(units, &shifts) {
+            Ok(()) => return,
+            Err(refusal) => refusal,
+        };
+        // The fold that was asked for could not be written: the fallback, if
+        // there is one, is tried the same way before the interval goes
+        // without.
+        if !self.fallback.is_empty() {
+            let asked = std::mem::replace(&mut self.wants, self.fallback.clone());
+            let built = self.build_with_either_shift(units, &shifts);
+            self.wants = asked;
+            if built.is_ok() {
+                self.stats.folds_fallen_back += 1;
+                return;
+            }
+        }
+        if refusal == Refusal::OverTheDomain {
+            self.stats.folds_over_the_domain += 1;
+        }
+    }
+
+    /// Build with the per-channel shifts, and with the smallest of them for
+    /// every channel if that cannot be written; keep what was built.
+    fn build_with_either_shift(&mut self, units: &[Held], shifts: &[u8]) -> Result<(), Refusal> {
+        if let Ok(built) = self.try_to_build(units, shifts) {
             self.take_what_was_built(built);
-            return;
+            return Ok(());
         }
         let least = shifts
             .iter()
@@ -2871,9 +2942,9 @@ impl Planning {
             Ok(built) => {
                 self.interval_shift = Some(common);
                 self.take_what_was_built(built);
+                Ok(())
             }
-            Err(Refusal::OverTheDomain) => self.stats.folds_over_the_domain += 1,
-            Err(Refusal::Unwritable) => {}
+            Err(refusal) => Err(refusal),
         }
     }
 
