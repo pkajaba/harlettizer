@@ -1336,7 +1336,9 @@ impl Encoder {
             self.take_the_plan(planning);
         }
         self.timed_phase(3, |encoder| encoder.prepare(&held));
-        self.timed_phase(5, |encoder| encoder.decide_second_filters(held.len()));
+        if self.effort != Effort::Realtime {
+            self.timed_phase(5, |encoder| encoder.decide_second_filters(held.len()));
+        }
         self.intervals_decided += 1;
         let channels = self.channels;
         let width = self.coded.frame_size;
@@ -1374,6 +1376,7 @@ impl Encoder {
             record,
             past: before,
             second_mode,
+            order: self.effort.fixed_order(),
         }
     }
 
@@ -1667,9 +1670,13 @@ impl Encoder {
         // The matrices, decided on the interval as it stands before them:
         // permuted, the dead bits off, the cascade off — the domain a decoder
         // applies them in, since it puts the dead bits back after them.
-        self.timed_phase(2, |encoder| encoder.suggest_matrices(units));
-        if self.since_restart == 0 {
-            self.timed_phase(4, |encoder| encoder.decide_matrices());
+        // Not at real-time effort: a coding matrix is a search over every
+        // channel pair of the interval, and the stream is valid without one.
+        if self.effort != Effort::Realtime {
+            self.timed_phase(2, |encoder| encoder.suggest_matrices(units));
+            if self.since_restart == 0 {
+                self.timed_phase(4, |encoder| encoder.decide_matrices());
+            }
         }
 
         // Pass three: the matrices on, each unit at its own place on their
@@ -3248,6 +3255,8 @@ struct Front {
     record: Record,
     past: Vec<History>,
     second_mode: Vec<Option<usize>>,
+    /// The one first-filter order to fit, where the effort fixes it.
+    order: Option<usize>,
 }
 
 /// What decides each block of an interval, channel by channel.
@@ -3291,12 +3300,13 @@ impl IntervalDecider {
             mut record,
             past,
             second_mode,
+            order,
         } = front;
         let units = record.held.len();
         self.prepared = std::mem::take(&mut record.prepared);
         self.past = past;
         self.second_mode = second_mode;
-        self.decide_interval(units);
+        self.decide_interval(units, order);
         let channels = self.channels;
         record.prepared = std::mem::take(&mut self.prepared);
         record.interval_decided =
@@ -3332,7 +3342,7 @@ impl IntervalDecider {
     /// the block before it left. The writer states the same codings again as
     /// it emits them, which is where the model this walk mirrors actually
     /// moves.
-    fn decide_interval(&mut self, units: usize) {
+    fn decide_interval(&mut self, units: usize, order: Option<usize>) {
         let width = self.coded.frame_size;
         for (channel, plane) in self.interval_planes.iter_mut().enumerate() {
             plane.clear();
@@ -3388,8 +3398,9 @@ impl IntervalDecider {
                 } else {
                     filter::state_from(history.window(), &residuals)
                 };
-                let (coding, _) = filter::choose_with(
+                let (coding, _) = filter::choose_fixed(
                     modes[channel],
+                    order,
                     history.window(),
                     state,
                     &samples[split..],

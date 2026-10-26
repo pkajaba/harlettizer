@@ -846,13 +846,13 @@ fn assert_folds_hold(
     planes: &[Vec<i32>],
     presentations: &[hz_mlp::hierarchy::Presentation],
 ) {
-    const ELEMENTS: usize = 12;
+    let elements = planes.len();
     let frames = planes[0].len();
     // The elements, exactly, and in order.
     let full = decoder::decode(&stream, 3).expect("the elements decode");
-    assert_eq!(full.channels, ELEMENTS);
+    assert_eq!(full.channels, elements);
     assert_eq!(full.frames(), frames);
-    for (frame, got) in full.samples.chunks_exact(ELEMENTS).enumerate() {
+    for (frame, got) in full.samples.chunks_exact(elements).enumerate() {
         for (element, sample) in got.iter().enumerate() {
             assert_eq!(
                 *sample, planes[element][frame],
@@ -954,4 +954,201 @@ fn a_fold_the_domain_cannot_hold_is_counted_and_not_written() {
             );
         }
     }
+}
+
+/// A programme-like sixteen-channel input: tones at different pitches, a
+/// little noise under them, and two objects that are nothing but noise.
+fn programme_16(frames: usize) -> Vec<Vec<i32>> {
+    (0..16)
+        .map(|channel| match channel {
+            14 | 15 => noise(0x4141 + channel as u64, frames, 22),
+            _ => {
+                let tonal = tone(frames, 20.0 + 7.3 * channel as f64, 2_000_000.0);
+                let hiss = noise(0x1000 + channel as u64, frames, 14);
+                tonal.iter().zip(&hiss).map(|(a, b)| a + b).collect()
+            }
+        })
+        .collect()
+}
+
+/// The real-time effort writes streams the reference decoder reads back
+/// exactly, at the shapes the transcoder uses and across restart intervals.
+#[test]
+fn realtime_effort_round_trips() {
+    // Three restart intervals and a ragged tail.
+    let frames = 3 * 128 * 40 + 17;
+    round_trip(
+        config(16, 48_000, SampleBits::TwentyFour),
+        &programme_16(frames),
+        Effort::Realtime,
+    );
+    round_trip(
+        config(8, 48_000, SampleBits::TwentyFour),
+        &programme_16(frames)[..8].to_vec(),
+        Effort::Realtime,
+    );
+    let planes = vec![
+        tone(frames, 4.7, 7_000_000.0),
+        noise(0x9999_aaaa, frames, 21),
+    ];
+    round_trip(
+        config(2, 48_000, SampleBits::TwentyFour),
+        &planes,
+        Effort::Realtime,
+    );
+}
+
+/// White noise on all sixteen channels, which prediction cannot help at all.
+///
+/// Sixteen channels of 24-bit audio are 18.4 Mbit/s uncompressed, above the
+/// 18.0 Mbit/s the stream declares, so no lossless coder fits full-scale noise
+/// on every channel; that case is only held to the slot. Noise a couple of bits
+/// below full scale is the worst input the cap leaves room for, and there the
+/// stream averages under the declared peak and the arrival schedule starves nothing.
+/// Both stay inside a MAT slot's 61440 bytes per 20 ms (twenty-four units of
+/// forty samples), and both decode back exactly.
+#[test]
+fn realtime_effort_on_white_noise_fits_the_rate_cap_and_the_slot() {
+    let frames = 2 * 128 * 40;
+    for (bits, fits_the_cap) in [(22, true), (23, true), (24, false)] {
+        let planes: Vec<Vec<i32>> = (0..16)
+            // Odd and far apart, so no two channels share a sequence.
+            .map(|channel| {
+                noise(
+                    (channel as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                    frames,
+                    bits,
+                )
+            })
+            .collect();
+        let config = config(16, 48_000, SampleBits::TwentyFour);
+        let mut encoder = Encoder::new(config).unwrap();
+        encoder.set_effort(Effort::Realtime);
+        let stream = encode(&mut encoder, &planes);
+        check(&encoder, &stream, &planes, config);
+        let stats = encoder.stats();
+        let cap = encoder.declared_peak_bitrate();
+        let rate = (stats.peak_unit_bytes as f64) * 8.0 / (40.0 / 48_000.0);
+        println!(
+            "{bits}-bit noise: largest unit {} bytes = {rate:.0} bit/s against {cap}, starved {}",
+            stats.peak_unit_bytes, stats.starved
+        );
+        assert!(
+            stats.peak_unit_bytes * 24 <= 61_440,
+            "{bits}-bit noise: twenty-four of the largest units overfill a MAT slot"
+        );
+        if fits_the_cap {
+            assert_eq!(
+                stats.starved, 0,
+                "{bits}-bit noise: a unit could not be placed"
+            );
+            let mean = stats.total_bytes as f64 * 8.0 / (frames as f64 / 48_000.0);
+            assert!(
+                mean <= cap as f64,
+                "{bits}-bit noise: the stream averages {mean:.0} bit/s"
+            );
+        }
+    }
+}
+
+/// Loud, full-bandwidth 24-bit material (tones near full scale with hiss, and
+/// two noisy channels) stays inside the declared rate: the cap is a limit on
+/// content that is nearly incompressible, not on loud music.
+#[test]
+fn realtime_effort_keeps_loud_24_bit_content_under_the_cap() {
+    let frames = 4 * 128 * 40;
+    let planes: Vec<Vec<i32>> = (0..16)
+        .map(|channel| match channel {
+            14 | 15 => noise(
+                (channel as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                frames,
+                20,
+            ),
+            _ => {
+                let tonal = tone(frames, 17.0 + 5.1 * channel as f64, 7_500_000.0);
+                let hiss = noise(
+                    (channel as u64 + 1).wrapping_mul(0xbf58_476d_1ce4_e5b9),
+                    frames,
+                    16,
+                );
+                tonal.iter().zip(&hiss).map(|(a, b)| a + b).collect()
+            }
+        })
+        .collect();
+    let config = config(16, 48_000, SampleBits::TwentyFour);
+    let mut encoder = Encoder::new(config).unwrap();
+    encoder.set_effort(Effort::Realtime);
+    let stream = encode(&mut encoder, &planes);
+    check(&encoder, &stream, &planes, config);
+    let stats = encoder.stats();
+    let cap = encoder.declared_peak_bitrate();
+    let mean = stats.total_bytes as f64 * 8.0 / (frames as f64 / 48_000.0);
+    println!(
+        "loud 24-bit content: mean {mean:.0} bit/s against {cap}, starved {}",
+        stats.starved
+    );
+    assert_eq!(stats.starved, 0);
+    assert!(mean <= cap as f64);
+    assert!(stats.peak_unit_bytes * 24 <= 61_440);
+}
+
+/// Folds stated by a caller over sixteen elements (a 2.0 and a 5.1 folded from
+/// an eight-element bed, the 7.1 the bed itself) hold in the real-time effort:
+/// the sixteen elements come back exactly and every narrower presentation is
+/// its fold.
+#[test]
+fn realtime_effort_carries_real_folds_for_sixteen_elements() {
+    use hz_mlp::hierarchy::Presentation;
+    const ELEMENTS: usize = 16;
+    let frames = 3 * 128 * 40;
+    let planes: Vec<Vec<i32>> = (0..ELEMENTS)
+        .map(|channel| {
+            let tonal = tone(frames, 23.0 + 6.1 * channel as f64, 1_500_000.0);
+            let hiss = noise(
+                (channel as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                frames,
+                12,
+            );
+            tonal.iter().zip(&hiss).map(|(a, b)| a + b).collect()
+        })
+        .collect();
+    let row = |gains: &[(usize, f64)]| {
+        let mut out = vec![0.0; ELEMENTS];
+        for &(element, gain) in gains {
+            out[element] = gain;
+        }
+        out
+    };
+    let seven: Vec<Vec<f64>> = (0..8).map(|c| row(&[(c, 1.0)])).collect();
+    let five = vec![
+        row(&[(0, 1.0)]),
+        row(&[(1, 1.0)]),
+        row(&[(2, 1.0)]),
+        row(&[(3, 1.0)]),
+        row(&[(4, 0.707), (6, 0.707)]),
+        row(&[(5, 0.707), (7, 0.707)]),
+    ];
+    let two = vec![
+        row(&[(0, 0.5), (2, 0.354), (4, 0.354), (6, 0.354)]),
+        row(&[(1, 0.5), (2, 0.354), (5, 0.354), (7, 0.354)]),
+    ];
+    let elements: Vec<Vec<f64>> = (0..ELEMENTS).map(|c| row(&[(c, 1.0)])).collect();
+    let presentations: Vec<Presentation> =
+        [(2usize, two), (6, five), (8, seven), (ELEMENTS, elements)]
+            .into_iter()
+            .map(|(channels, rows)| Presentation { channels, rows })
+            .collect();
+
+    let config = config(ELEMENTS, 48_000, SampleBits::TwentyFour);
+    let mut encoder = Encoder::new(config).unwrap();
+    encoder.set_effort(Effort::Realtime);
+    encoder.set_presentations(&presentations);
+    let stream = encode(&mut encoder, &planes);
+    let stats = encoder.stats();
+    assert_eq!(
+        stats.folds_carried, stats.folds_asked,
+        "every interval carries its folds"
+    );
+    assert!(stats.folds_carried > 0);
+    assert_folds_hold(&stream, &planes, &presentations);
 }

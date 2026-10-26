@@ -258,11 +258,31 @@ const FAST_DESIGN: usize = 3;
 /// every other restart. Measured on the fixtures, `Fast` gives up 0.1 to
 /// 0.2 % of a programme stream and half a per cent of a synthetic one, for
 /// about half the encoding time.
+///
+/// `Realtime` is for an encoder that has to keep up with a live source on a
+/// small core: no second filter, no coding matrices, and one first filter of a
+/// fixed order per block, fitted and priced against the plain coding and the
+/// filter already in force. See [`REALTIME_ORDER`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Effort {
     #[default]
     Full,
     Fast,
+    Realtime,
+}
+
+/// The one filter order [`Effort::Realtime`] fits.
+///
+/// Chosen by measuring the fixtures (tonal, programme-like and noise) at
+/// orders two to eight: past four the stream shrank by under a per cent for
+/// the cost of a longer residual pass per block.
+pub const REALTIME_ORDER: usize = 4;
+
+impl Effort {
+    /// The only first-filter order this effort fits, where it is fixed.
+    pub(crate) fn fixed_order(self) -> Option<usize> {
+        (self == Effort::Realtime).then_some(REALTIME_ORDER)
+    }
 }
 
 /// Which second filter a channel should carry through the coming interval,
@@ -290,6 +310,9 @@ pub fn pick_second(
     effort: Effort,
     restart: u64,
 ) -> Option<usize> {
+    if effort == Effort::Realtime {
+        return None;
+    }
     if history.len() < TRIAL_BLOCKS * crate::format::MAX_BLOCK.min(40) + FIT_CONTEXT {
         return None;
     }
@@ -297,6 +320,7 @@ pub fn pick_second(
         Effort::Full => &[0, 1, 2, 3],
         Effort::Fast if restart % 2 == 1 => return current,
         Effort::Fast => &[FAST_DESIGN],
+        Effort::Realtime => return None,
     };
     // The five trials are independent — each codes the same history in one
     // mode — and there are only twelve channels to spread over thirty-two
@@ -428,6 +452,20 @@ pub fn choose_with(
     residuals: &mut [i32],
     in_force: &Filter,
 ) -> (Coding, usize) {
+    choose_fixed(second, None, context, state, samples, residuals, in_force)
+}
+
+/// As [`choose_with`], with the first filter's order fixed where `order` says:
+/// one fit, one candidate, instead of every order up to the format's largest.
+pub fn choose_fixed(
+    second: Option<usize>,
+    order: Option<usize>,
+    context: &[i32],
+    state: State,
+    samples: &[i32],
+    residuals: &mut [i32],
+    in_force: &Filter,
+) -> (Coding, usize) {
     debug_assert_eq!(samples.len(), residuals.len());
     let past = context;
 
@@ -507,8 +545,9 @@ pub fn choose_with(
     // pair built on it and this fit is never looked at. Computing it anyway
     // was a Levinson-Durbin over the whole context per block, thrown away.
     if second.is_none() {
-        let fitted = lpc::fit(&context[..total], MAX_ORDER);
-        for order in 1..=fitted.orders {
+        let top = order.unwrap_or(MAX_ORDER);
+        let fitted = lpc::fit(&context[..total], top);
+        for order in order.unwrap_or(1)..=fitted.orders {
             let Some(quantised) = lpc::quantise(&fitted.coefficients[order - 1], order) else {
                 continue;
             };
