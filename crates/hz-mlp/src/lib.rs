@@ -18,6 +18,7 @@
 //! # Ok::<(), hz_mlp::Unsupported>(())
 //! ```
 
+mod affinity;
 pub mod arrange;
 pub mod crc;
 pub mod encoder;
@@ -34,6 +35,7 @@ pub mod protection;
 mod rate;
 pub mod reader;
 
+pub use affinity::{confine_current_thread, set_pool_cores};
 pub use encoder::Encoder;
 pub use filter::Effort;
 pub use format::{Config, MAX_CHANNELS, SampleBits, Unsupported};

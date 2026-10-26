@@ -227,23 +227,62 @@ impl Default for Decided {
 
 /// Where the per-channel search runs.
 ///
-/// A pool of its own, sized to the channel count, rather than the global one.
-/// A stream has between one and sixteen channels and a machine may have far
-/// more cores than that: handing six independent searches to a pool of
-/// thirty-two costs more in dispatch and stolen cache lines than the extra
-/// threads can win back. Measured on a 5.1 programme at full effort — 3.34 s
-/// through a thirty-two thread pool against 1.86 s through a six-thread one,
-/// for exactly the same work.
-///
-/// Without the feature it is a unit, and every `install` below is the closure
-/// called where it stands.
+/// One process-wide pool, bounded to [`MAX_POOL_THREADS`] threads, shared by
+/// every encoder and by every stage of an encoder. A stream has between one
+/// and sixteen channels and a machine may have far more cores than that:
+/// handing six independent searches to a pool of thirty-two costs more in
+/// dispatch and stolen cache lines than the extra threads can win back, and a
+/// second pool for the block decisions put eleven more threads on a machine
+/// with four fast cores. Seeking (a new encoder) reuses the pool instead of
+/// building one.
 #[cfg(feature = "parallel")]
 #[derive(Debug)]
-struct Threads(Option<rayon::ThreadPool>);
+struct Threads(Option<std::sync::Arc<rayon::ThreadPool>>);
 
 #[cfg(not(feature = "parallel"))]
 #[derive(Debug)]
 struct Threads;
+
+/// The most threads the shared pool has: the fast cores of a big.LITTLE part
+/// the real-time use targets, of which four is the usual count. Fewer on a
+/// machine with fewer.
+#[cfg(feature = "parallel")]
+const MAX_POOL_THREADS: usize = 4;
+
+#[cfg(feature = "parallel")]
+static POOL: std::sync::OnceLock<Option<std::sync::Arc<rayon::ThreadPool>>> =
+    std::sync::OnceLock::new();
+
+/// Whether the shared pool has been built, after which its cores are settled.
+#[cfg(feature = "parallel")]
+pub(crate) fn pool_exists() -> bool {
+    POOL.get().is_some()
+}
+
+#[cfg(not(feature = "parallel"))]
+pub(crate) fn pool_exists() -> bool {
+    false
+}
+
+#[cfg(feature = "parallel")]
+fn shared_pool() -> Option<std::sync::Arc<rayon::ThreadPool>> {
+    POOL.get_or_init(|| {
+        let pinned = crate::affinity::pool_cores();
+        let cores = if pinned.is_empty() {
+            std::thread::available_parallelism().map_or(MAX_POOL_THREADS, |n| n.get())
+        } else {
+            pinned.len()
+        };
+        let mut builder = rayon::ThreadPoolBuilder::new()
+            .num_threads(cores.clamp(1, MAX_POOL_THREADS))
+            .thread_name(|i| format!("hz-mlp-{i}"));
+        if !pinned.is_empty() {
+            builder = builder.start_handler(move |_| crate::affinity::pin_current_thread(&pinned));
+        }
+        builder.build().ok().map(std::sync::Arc::new)
+    })
+    .clone()
+}
 
 impl Threads {
     #[cfg(feature = "parallel")]
@@ -253,24 +292,13 @@ impl Threads {
         if channels < 2 {
             return Self(None);
         }
-        let cores = std::thread::available_parallelism().map_or(channels, |n| n.get());
-        Self(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(cores)
-                .build()
-                .ok(),
-        )
+        Self(shared_pool())
     }
 
-    /// A pool of exactly `threads` threads.
+    /// The shared pool, whatever a stage would have liked for itself.
     #[cfg(feature = "parallel")]
-    fn exactly(threads: usize) -> Self {
-        Self(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads.max(1))
-                .build()
-                .ok(),
-        )
+    fn exactly(_threads: usize) -> Self {
+        Self(shared_pool())
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -298,6 +326,47 @@ impl Threads {
     #[cfg(not(feature = "parallel"))]
     fn map<T, R>(&self, items: &[T], f: impl Fn(&T) -> R) -> Vec<R> {
         items.iter().map(f).collect()
+    }
+
+    /// Run `a`, `b` and `c` beside `main`, which runs on the calling thread,
+    /// and hand back all four results. On the shared pool where there is
+    /// one, so an interval costs no thread of its own; on scoped threads
+    /// otherwise.
+    fn fork3<A: Send, B: Send, C: Send, R>(
+        &self,
+        a: impl FnOnce() -> A + Send,
+        b: impl FnOnce() -> B + Send,
+        c: impl FnOnce() -> C + Send,
+        main: impl FnOnce() -> R,
+    ) -> (A, B, C, R) {
+        #[cfg(feature = "parallel")]
+        if let Some(pool) = &self.0 {
+            let (mut ra, mut rb, mut rc) = (None, None, None);
+            let r = pool.in_place_scope(|scope| {
+                scope.spawn(|_| ra = Some(a()));
+                scope.spawn(|_| rb = Some(b()));
+                scope.spawn(|_| rc = Some(c()));
+                main()
+            });
+            return (
+                ra.expect("the first task ran"),
+                rb.expect("the second task ran"),
+                rc.expect("the third task ran"),
+                r,
+            );
+        }
+        std::thread::scope(|scope| {
+            let ha = scope.spawn(a);
+            let hb = scope.spawn(b);
+            let hc = scope.spawn(c);
+            let r = main();
+            (
+                ha.join().expect("an interval's task does not panic"),
+                hb.join().expect("an interval's task does not panic"),
+                hc.join().expect("an interval's task does not panic"),
+                r,
+            )
+        })
     }
 }
 
@@ -747,17 +816,10 @@ impl Encoder {
             back: Some(IntervalDecider {
                 channels: config.channels,
                 coded,
-                // A pool of its own, of two threads for every three channels,
-                // and never fewer than four or than the channels there are: a
-                // stereo on one thread decided its two channels one after the
-                // other. Sharing the encoder's, the blocks took threads the
-                // preparing of the next interval was waiting for, and that is
-                // the longer of the two: five minutes of an overlay at twelve
-                // channels took 11.3 s so, and on a pool of its own 13.5 s at
-                // three threads, 11.5 at four, 10.1 at six, 10.2 at eight
-                // and 10.7 at sixteen. With `--fast` the preparing is lighter
-                // and the blocks are the longer: 7.4 s at six, 7.2 at eight,
-                // 7.5 at twelve — and at full effort eight is as good as six.
+                // The shared pool, like the encoder's own stages. A pool of its
+                // own put eleven more threads on a machine with four fast
+                // cores, and the blocks took threads the preparing of the
+                // next interval was waiting for.
                 threads: std::sync::Arc::new(Threads::exactly(
                     (2 * config.channels)
                         .div_ceil(3)
@@ -1265,30 +1327,19 @@ impl Encoder {
         // it prepared, the one before that decided block by block, and the one
         // before that written. None reads what another changes — see
         // [`Planning`], [`IntervalDecider`] and [`Writer`].
-        let (planning, front, backed, written, writer, back) = std::thread::scope(|scope| {
-            let plan = scope.spawn(|| planning.plan(&held));
-            let write = scope.spawn(move || {
+        let threads = std::sync::Arc::clone(&self.threads);
+        let (planning, (written, writer), (backed, back), front) = threads.fork3(
+            || planning.plan(&held),
+            move || {
                 let written = decided.map(|record| writer.write(record));
                 (written, writer)
-            });
-            let decide = scope.spawn(move || {
+            },
+            move || {
                 let backed = fronted.map(|front| back.decide(front));
                 (backed, back)
-            });
-            let front = planned.map(|planned| self.decide(planned));
-            let (written, writer) = write.join().expect("writing an interval does not panic");
-            let (backed, back) = decide
-                .join()
-                .expect("deciding an interval's blocks does not panic");
-            (
-                plan.join().expect("working out an interval does not panic"),
-                front,
-                backed,
-                written,
-                writer,
-                back,
-            )
-        });
+            },
+            || planned.map(|planned| self.decide(planned)),
+        );
         self.writer = Some(writer);
         self.back = Some(back);
         self.fronted = front;
@@ -4360,5 +4411,36 @@ mod shift_tests {
         // The field is four bits and signed, so seven.
         let samples: Vec<i32> = (1..8).map(|v| v << 20).collect();
         assert_eq!(wasted_bits(&samples), Some(crate::frame::MAX_OUTPUT_SHIFT));
+    }
+}
+
+#[cfg(all(test, feature = "parallel"))]
+mod shared_pool_tests {
+    use super::*;
+
+    #[test]
+    fn every_encoder_shares_one_bounded_pool_and_it_cannot_be_moved_afterwards() {
+        let first = Threads::new(16);
+        let second = Threads::exactly(4);
+        let (a, b) = (first.0.as_ref(), second.0.as_ref());
+        let (a, b) = (a.expect("a pool for sixteen channels"), b.expect("a pool"));
+        assert!(std::sync::Arc::ptr_eq(a, b), "one pool for every stage");
+        assert!(a.current_num_threads() <= MAX_POOL_THREADS);
+        assert!(
+            Threads::new(1).0.is_none(),
+            "one channel has nothing to spread"
+        );
+
+        // The pool is built, so its cores are settled.
+        assert!(pool_exists());
+        assert!(!crate::affinity::set_pool_cores(&[0]));
+        assert!(!crate::affinity::set_pool_cores(&[]));
+    }
+
+    #[test]
+    fn the_interval_stages_run_on_the_pool_and_hand_back_every_result() {
+        let threads = Threads::new(16);
+        let (a, b, c, main) = threads.fork3(|| 1, || "two", || 3.0, || 'm');
+        assert_eq!((a, b, c, main), (1, "two", 3.0, 'm'));
     }
 }
