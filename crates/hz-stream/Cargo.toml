@@ -1,0 +1,28 @@
+[package]
+name = "hz-stream"
+description = "Real-time DTS to TrueHD conversion for a player: bytes in, access units out, nothing on disk"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+# The decoder it sits on (`dca`) needs 1.89; the codec crates stay on the
+# workspace's own.
+rust-version = "1.89"
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+hz-core.workspace = true
+hz-meta.workspace = true
+hz-mlp = { workspace = true, features = ["parallel"] }
+# The decoder is the bridge's, pinned to the commit that carries the
+# extension waveforms past a release and the core-only route. A tag may
+# replace the revision once the bridge cuts one.
+dca = { git = "https://github.com/harletty/harletty-bridge", rev = "dea43c675072b51b706d20c0bd924ded7c50b116" }
+log = "0.4"
+
+[dev-dependencies]
+hz-dca.workspace = true
+
+[[bench]]
+name = "synthetic"
+harness = false

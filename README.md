@@ -360,7 +360,9 @@ sequences), `hz-programme` (what every writer does before its own format:
 reading a master, its tracks and object paths, rendering, mixing a fold or an
 overlay, coding samples) and `hz-cli`. The codec crates never depend on each
 other, and `hz-programme` depends on none of them; only `hz-cli` knows all of
-them.
+them. `hz-stream` is the other front end: a DTS stream in, a TrueHD stream
+out, in memory and in real time, for a player; `hz-stream-ffi` is its C ABI
+([docs/stream.md](docs/stream.md)).
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Documentation
@@ -371,6 +373,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 | [docs/joc.md](docs/joc.md) | Joint object coding: the payload layer, how it is held to the reference streams, and the one shape every reference stream codes its objects in |
 | [docs/eac3.md](docs/eac3.md) | `ac3 --eac3`: the independent substream, where the objects go, how it compares with FFmpeg, and the graft of a reference stream's objects onto our core |
 | [docs/dts.md](docs/dts.md) | The `dts` command: the standard DTS:X profile and the 5.1 and 7.1 beds, raw or in Matroska, how they are checked, the navigation limit, and how to try it on a receiver |
+| [docs/stream.md](docs/stream.md) | `hz-stream` and `hz-stream-ffi`: the pipeline a player drives, its threads and buffers, the C ABI and how it is versioned, and what it does about keys |
 | [docs/ac3.md](docs/ac3.md) | The `ac3` command: the render and fold, the encoder ported from FFmpeg, how it compares, and what is not done |
 | [docs/iamf.md](docs/iamf.md) | The `iamf` command: the bed and the v2.0 objects, the render, the loudness, the FLAC encoder, Opus, Matroska and MP4, the options, what checked each, and what is not done |
 | [docs/mlp-state.md](docs/mlp-state.md) | What the MLP encoder writes today — every constant and decision in force |

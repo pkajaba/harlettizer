@@ -179,6 +179,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dca"
+version = "0.9.0"
+source = "git+https://github.com/harletty/harletty-bridge?rev=dea43c675072b51b706d20c0bd924ded7c50b116#dea43c675072b51b706d20c0bd924ded7c50b116"
+dependencies = [
+ "log",
+ "rustfft",
+ "thiserror",
+]
+
+[[package]]
 name = "eac3"
 version = "0.9.0"
 source = "git+https://github.com/harletty/harletty-bridge?tag=v0.9.0#9556bcedfd6e71461d49fd3f03fcfdf87351b67f"
@@ -340,6 +350,26 @@ name = "hz-render"
 version = "0.1.0"
 dependencies = [
  "hz-core",
+]
+
+[[package]]
+name = "hz-stream"
+version = "0.1.0"
+dependencies = [
+ "dca 0.9.0 (git+https://github.com/harletty/harletty-bridge?rev=dea43c675072b51b706d20c0bd924ded7c50b116)",
+ "hz-core",
+ "hz-dca",
+ "hz-meta",
+ "hz-mlp",
+ "log",
+]
+
+[[package]]
+name = "hz-stream-ffi"
+version = "0.1.0"
+dependencies = [
+ "hz-dca",
+ "hz-stream",
 ]
 
 [[package]]
@@ -730,7 +760,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "clap",
- "dca",
+ "dca 0.9.0 (git+https://github.com/harletty/harletty-bridge?tag=v0.9.0)",
  "eac3",
  "hz-ac3",
  "hz-analysis",

@@ -24,6 +24,8 @@ members = [
     "crates/hz-mlp",
     "crates/hz-programme",
     "crates/hz-render",
+    "crates/hz-stream",
+    "crates/hz-stream-ffi",
     "xtask",
 ]
 
@@ -49,6 +51,7 @@ hz-meta = { path = "crates/hz-meta" }
 hz-mlp = { path = "crates/hz-mlp" }
 hz-programme = { path = "crates/hz-programme" }
 hz-render = { path = "crates/hz-render" }
+hz-stream = { path = "crates/hz-stream" }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml_ng = "0.10"
 serde_json = "1.0"

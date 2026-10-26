@@ -1,0 +1,19 @@
+[package]
+name = "hz-stream-ffi"
+description = "C ABI for hz-stream: a library a player loads at run time"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version = "1.89"
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "hz_stream_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+hz-stream.workspace = true
+
+[dev-dependencies]
+hz-dca.workspace = true
