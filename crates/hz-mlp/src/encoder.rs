@@ -519,6 +519,10 @@ pub struct Encoder {
     /// The interval being held, and the buffers its units came back in.
     pending: Vec<Held>,
     spare: Vec<Held>,
+    /// A partial access unit [`Encoder::push_planes`] has taken and not yet
+    /// completed, interleaved, and how many frames of it there are.
+    carry: Vec<i32>,
+    carry_frames: usize,
     /// The held interval's units, each one's channels side by side, while
     /// they are prepared: one chunk per unit is what lets the units go across
     /// the pool. Kept between intervals rather than allocated for each.
@@ -781,6 +785,8 @@ impl Encoder {
             max_output_bits: crate::frame::CODEC_BITS as u8,
             pending: Vec::with_capacity(RESTART_INTERVAL as usize),
             spare: Vec::new(),
+            carry: Vec::new(),
+            carry_frames: 0,
             unit_scratch: Vec::new(),
             candidates: vec![Vec::new(); config.channels],
             dynamic_range: [None; MAX_SUBSTREAMS],
@@ -1061,14 +1067,85 @@ impl Encoder {
         }
     }
 
+    /// Encode any number of frames given as one plane per channel, laid end
+    /// to end (`channels * frames` samples, channel-major), in whatever length
+    /// the source produces them. Whole access units are cut from the planes
+    /// and written straight into the interval being held, with no unit-sized
+    /// interleaving buffer in between; what does not make a whole unit is
+    /// kept for the next call, and [`Encoder::finish_carried`] ends the stream
+    /// with it. Hands back bytes as [`Encoder::push`] does. Do not mix with
+    /// [`Encoder::push`] on one stream.
+    ///
+    /// # Panics
+    /// If `planes` is not `channels * frames` long.
+    pub fn push_planes(&mut self, planes: &[i32], frames: usize) -> Vec<u8> {
+        let channels = self.channels;
+        let unit = self.coded.frame_size;
+        assert_eq!(planes.len(), channels * frames, "one plane per channel");
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < frames {
+            let take = (unit - self.carry_frames).min(frames - at);
+            if self.carry_frames == 0 && take == unit {
+                self.hold_with(unit, 0, |samples| {
+                    for (channel, plane) in planes.chunks_exact(frames).enumerate() {
+                        for (frame, sample) in plane[at..at + unit].iter().enumerate() {
+                            samples[frame * channels + channel] = *sample;
+                        }
+                    }
+                });
+            } else {
+                self.carry.resize(unit * channels, 0);
+                for (channel, plane) in planes.chunks_exact(frames).enumerate() {
+                    for (frame, sample) in plane[at..at + take].iter().enumerate() {
+                        self.carry[(self.carry_frames + frame) * channels + channel] = *sample;
+                    }
+                }
+                self.carry_frames += take;
+                if self.carry_frames < unit {
+                    at += take;
+                    continue;
+                }
+                let carried = std::mem::take(&mut self.carry);
+                self.hold(&carried, unit, 0);
+                self.carry = carried;
+                self.carry_frames = 0;
+            }
+            at += take;
+            if self.pending.len() as u64 == RESTART_INTERVAL {
+                out.extend_from_slice(&self.advance());
+            }
+        }
+        out
+    }
+
+    /// End a stream fed by [`Encoder::push_planes`]: the frames it carries
+    /// become the short last unit, and everything not yet written follows.
+    pub fn finish_carried(&mut self) -> Vec<u8> {
+        let carried = std::mem::take(&mut self.carry);
+        let frames = self.carry_frames;
+        self.carry_frames = 0;
+        let out = self.finish(&carried[..frames * self.channels]);
+        self.carry = carried;
+        out
+    }
+
     /// Take one access unit's samples, and its payload, into the interval
     /// being held.
     fn hold(&mut self, interleaved: &[i32], frames: usize, padding: usize) {
+        self.hold_with(frames, padding, |samples| {
+            samples[..interleaved.len()].copy_from_slice(interleaved);
+            samples[interleaved.len()..].fill(0);
+        });
+    }
+
+    /// As [`Encoder::hold`], with the unit's samples written by `fill` into
+    /// the buffer they will live in.
+    fn hold_with(&mut self, frames: usize, padding: usize, fill: impl FnOnce(&mut [i32])) {
         let width = self.coded.frame_size * self.channels;
         let mut held = self.spare.pop().unwrap_or_default();
         held.samples.resize(width, 0);
-        held.samples[..interleaved.len()].copy_from_slice(interleaved);
-        held.samples[interleaved.len()..].fill(0);
+        fill(&mut held.samples);
         held.frames = frames;
         held.padding = padding;
         held.payload.clear();

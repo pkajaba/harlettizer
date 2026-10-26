@@ -1152,3 +1152,37 @@ fn realtime_effort_carries_real_folds_for_sixteen_elements() {
     assert!(stats.folds_carried > 0);
     assert_folds_hold(&stream, &planes, &presentations);
 }
+
+/// Feeding planes in lengths that are not a whole number of units writes
+/// exactly the stream feeding the units one by one does, ragged end included.
+#[test]
+fn planes_in_any_length_write_the_same_stream_as_units() {
+    let frames = 2 * 128 * 40 + 133;
+    let planes = programme_16(frames);
+    let config = config(16, 48_000, SampleBits::TwentyFour);
+    let mut by_units = Encoder::new(config).unwrap();
+    by_units.set_effort(Effort::Realtime);
+    let wanted = encode(&mut by_units, &planes);
+
+    for chunk in [512usize, 1, 39, 40, 41, 1000] {
+        let mut encoder = Encoder::new(config).unwrap();
+        encoder.set_effort(Effort::Realtime);
+        assert!(
+            encoder.push_planes(&[], 0).is_empty(),
+            "no frames, no bytes"
+        );
+        let mut stream = Vec::new();
+        let mut at = 0;
+        while at < frames {
+            let n = chunk.min(frames - at);
+            let laid: Vec<i32> = planes
+                .iter()
+                .flat_map(|p| p[at..at + n].iter().copied())
+                .collect();
+            stream.extend_from_slice(&encoder.push_planes(&laid, n));
+            at += n;
+        }
+        stream.extend_from_slice(&encoder.finish_carried());
+        assert_eq!(stream, wanted, "chunks of {chunk}");
+    }
+}
