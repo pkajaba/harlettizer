@@ -254,3 +254,28 @@ fn an_exact_length_gains_no_empty_unit() {
     let stream = encode(48_000, 2, SampleBits::TwentyFour, 40 * 7);
     assert_eq!(walk(&stream).len(), 7);
 }
+
+/// Dialogue normalisation 31 is "no normalisation"; 0 would be a 31 dB cut at
+/// a decoder that applies it. Every restart of every shape says 31, in the
+/// two-, six- and eight-channel fields alike.
+#[test]
+fn every_major_sync_leaves_the_level_alone() {
+    for channels in [2usize, 6, 8] {
+        let stream = encode(48_000, channels, SampleBits::TwentyFour, 40 * 300);
+        let units = hz_mlp::reader::stream(&stream).expect("the stream reads back");
+        let syncs: Vec<_> = units.iter().filter_map(|u| u.major_sync.as_ref()).collect();
+        assert!(syncs.len() > 1, "{channels} ch: more than one restart");
+        for sync in syncs {
+            assert!(sync.checksum_ok);
+            assert_eq!(
+                (
+                    sync.dialogue_norm_2ch,
+                    sync.dialogue_norm_6ch,
+                    sync.dialogue_norm_8ch
+                ),
+                (31, 31, 31),
+                "{channels} ch"
+            );
+        }
+    }
+}

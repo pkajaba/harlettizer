@@ -46,6 +46,12 @@ pub struct MajorSync {
     pub substreams: usize,
     pub extended_substream_info: u32,
     pub substream_info: u32,
+    /// Dialogue normalisation of the two-, six- and eight-channel
+    /// presentations. A decoder applies it as an attenuation of that many dB
+    /// below 31, so 31 is the value that leaves the level alone.
+    pub dialogue_norm_2ch: u32,
+    pub dialogue_norm_6ch: u32,
+    pub dialogue_norm_8ch: u32,
     /// The extra channel meaning, when there is one: its bytes, and what the
     /// sixteen-element presentation says about itself if it names one.
     pub extra_channel_meaning: Option<Vec<u8>>,
@@ -431,6 +437,14 @@ fn major_sync(bytes: &[u8]) -> Result<MajorSync> {
     let substreams = reader.get(4)? as usize;
     let extended_substream_info = reader.get(4)?;
     let substream_info = reader.get(8)?;
+    // Reserved bits, the three control-enable flags and a reserved bit, then
+    // the start-up gain's seven.
+    reader.skip(6 + 3 + 1 + 7)?;
+    let dialogue_norm_2ch = reader.get(6)?;
+    reader.skip(6)?; // two-channel mix level
+    let dialogue_norm_6ch = reader.get(5)?;
+    reader.skip(6 + 5)?; // six-channel mix level and source format
+    let dialogue_norm_8ch = reader.get(5)?;
 
     let extra_channel_meaning = has_extra.then(|| bytes[26..size - 2].to_vec());
     // The sixteen-element fields are there only when the top bit of
@@ -460,6 +474,9 @@ fn major_sync(bytes: &[u8]) -> Result<MajorSync> {
         substreams,
         extended_substream_info,
         substream_info,
+        dialogue_norm_2ch,
+        dialogue_norm_6ch,
+        dialogue_norm_8ch,
         extra_channel_meaning,
         immersive,
         checksum_ok,

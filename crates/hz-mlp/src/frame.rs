@@ -353,12 +353,12 @@ fn write_major_sync(writer: &mut BitWriter, coded: &Coded, start_up_gain: i32) {
     writer.put(1, 0); // 8-channel control enabled
     writer.put(1, 0); // reserved
     writer.put_signed(7, start_up_gain);
-    writer.put(6, 0); // 2-channel dialogue normalisation
+    writer.put(6, 31); // 2-channel dialogue normalisation: 31 is "none", 0 is a 31 dB cut
     writer.put(6, 0); // 2-channel mix level
-    writer.put(5, 0); // 6-channel dialogue normalisation
+    writer.put(5, 31); // 6-channel dialogue normalisation
     writer.put(6, 0); // 6-channel mix level
     writer.put(5, 0); // 6-channel source format
-    writer.put(5, 0); // 8-channel dialogue normalisation
+    writer.put(5, 31); // 8-channel dialogue normalisation
     writer.put(6, 0); // 8-channel mix level
     writer.put(6, 0); // 8-channel source format
     writer.put(1, 0); // reserved
